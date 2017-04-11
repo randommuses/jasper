@@ -1,6 +1,7 @@
 ﻿using JasperBus.Runtime;
 using JasperBus.Runtime.Invocation;
 using JasperBus.Runtime.Serializers;
+using JasperBus.Runtime.Subscriptions;
 using JasperBus.Transports.LightningQueues;
 using StructureMap;
 
@@ -12,10 +13,13 @@ namespace JasperBus
         {
             For<ITransport>().Singleton().Add<LightningQueuesTransport>();
 
-
             For<IEnvelopeSender>().Use<EnvelopeSender>();
             For<IServiceBus>().Use<ServiceBus>();
             For<IHandlerPipeline>().Use<HandlerPipeline>();
+
+            ForSingletonOf<INodeDiscovery>().UseIfNone<InMemoryNodeDiscovery>();
+            ForSingletonOf<ISubscriptionsRepository>().UseIfNone<SubscriptionsRepository>();
+            ForSingletonOf<ISubscriptionCache>().Use<SubscriptionCache>();
 
             ForSingletonOf<IEnvelopeSerializer>().Use<EnvelopeSerializer>();
             For<IMessageSerializer>().Add<JsonMessageSerializer>();

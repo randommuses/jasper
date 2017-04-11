@@ -1,4 +1,6 @@
-﻿using System.Linq;
+﻿using System;
+using System.Linq;
+using System.Reflection;
 using System.Threading.Tasks;
 using Baseline;
 using Jasper;
@@ -9,6 +11,8 @@ using JasperBus.Model;
 using JasperBus.Runtime;
 using JasperBus.Runtime.Invocation;
 using JasperBus.Runtime.Serializers;
+using JasperBus.Runtime.Subscriptions;
+using JasperBus.Transports.LightningQueues;
 using StructureMap;
 using Policies = JasperBus.Configuration.Policies;
 
@@ -27,6 +31,7 @@ namespace JasperBus
 
         public readonly Registry Services = new ServiceBusRegistry();
 
+
         public void Dispose()
         {
             Channels.Dispose();
@@ -41,23 +46,20 @@ namespace JasperBus
         {
             return Task.Factory.StartNew(() =>
             {
+                var container = runtime.Container;
+
                 // TODO -- will need to be smart enough to do the conglomerate
                 // generation config of the base, with service bus specific stuff
-                _graph.Compile(generation, runtime.Container);
+                _graph.Compile(generation, container);
 
-                var transports = runtime.Container.GetAllInstances<ITransport>().ToArray();
+                var transports = container.GetAllInstances<ITransport>().ToArray();
 
                 Channels.UseTransports(transports);
 
                 configureSerializationOrder(runtime);
 
-                // TODO
-                // Done -- 1. Start up transports
-                // 2. Start up subscriptions when ready
+                var pipeline = container.GetInstance<IHandlerPipeline>();
 
-                var pipeline = runtime.Container.GetInstance<IHandlerPipeline>();
-
-                // TODO -- might parallelize this later
                 foreach (var transport in transports)
                 {
                     transport.Start(pipeline, Channels);
@@ -69,14 +71,17 @@ namespace JasperBus
                             x.Sender = new NulloSender(transport, x.Uri);
                         });
                 }
+
+                container.GetInstance<INodeDiscovery>().Register(Channels);
+
+                setupSubscriptions(container);
             });
-
-
         }
 
         private void configureSerializationOrder(JasperRuntime runtime)
         {
-            var contentTypes = runtime.Container.GetAllInstances<IMessageSerializer>().Select(x => x.ContentType).ToArray();
+            var contentTypes = runtime.Container.GetAllInstances<IMessageSerializer>()
+                .Select(x => x.ContentType).ToArray();
 
             var unknown = Channels.AcceptedContentTypes.Where(x => !contentTypes.Contains(x)).ToArray();
             if (unknown.Any())
@@ -88,8 +93,48 @@ namespace JasperBus
             {
                 Channels.AcceptedContentTypes.Fill(contentType);
             }
+        }
 
+        private void setupSubscriptions(IContainer container)
+        {
+            var subRepository = container.GetInstance<ISubscriptionsRepository>();
+            var subCache = container.GetInstance<ISubscriptionCache>();
+            var sender = container.GetInstance<IEnvelopeSender>();
 
+            var staticSubscriptions = container.GetAllInstances<ISubscriptionRequirements>()
+                .SelectMany(x => x.DetermineRequirements())
+                .Select(x =>
+                {
+                    x.Id = Guid.NewGuid();
+                    x.NodeName = Channels.Name;
+                    x.Role = SubscriptionRole.Subscribes;
+                    x.Receiver = x.Receiver.ToMachineUri();
+                    return x;
+                });
+
+            subRepository.PersistSubscriptions(staticSubscriptions);
+
+            sendSubscriptions(subRepository, sender);
+
+            subCache.LoadSubscriptions(subRepository.LoadSubscriptions(SubscriptionRole.Publishes));
+        }
+
+        private void sendSubscriptions(ISubscriptionsRepository repository, IEnvelopeSender sender)
+        {
+            repository.LoadSubscriptions(SubscriptionRole.Subscribes)
+                .GroupBy(x => x.Source)
+                .Each(group =>
+                {
+                    var envelope = new Envelope
+                    {
+                        Message = new SubscriptionRequested
+                        {
+                            Subscriptions = group.Each(x => x.Source = x.Source.ToMachineUri()).ToArray()
+                        },
+                        Destination = group.Key
+                    };
+                    sender.Send(envelope);
+                });
         }
 
         private async Task<Registry> bootstrap(JasperRegistry registry)
@@ -98,6 +143,13 @@ namespace JasperBus
 
             _graph = new HandlerGraph();
             _graph.AddRange(calls);
+
+            var subscriptionHandlerType = typeof(SubscriptionsHandler);
+            _graph.Add(
+                new HandlerCall(
+                    subscriptionHandlerType,
+                    subscriptionHandlerType.GetMethod("Handle", new[] {typeof(SubscriptionRequested)}))
+            );
 
             _graph.Group();
             Policies.Apply(_graph);
